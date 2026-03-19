@@ -1,4 +1,6 @@
 import WebSocket, { type ClientOptions as WsClientOptions } from 'ws';
+import { getProxyForUrl } from 'proxy-from-env';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import type { Logger, WsFrame } from './types';
 import { WsCmd, WSAuthFailureError, WSReconnectExhaustedError } from './types';
 import { generateReqId } from './utils';
@@ -135,8 +137,14 @@ export class WsConnectionManager {
 
     this.logger.info(`Connecting to WebSocket: ${this.wsUrl}...`);
 
+    const mergedOptions: WsClientOptions = { ...this.wsOptions };
+    const proxyUrl = getProxyForUrl(this.wsUrl);
+    if (proxyUrl && !mergedOptions.agent) {
+      mergedOptions.agent = new HttpsProxyAgent(proxyUrl);
+    }
+
     try {
-      this.ws = new WebSocket(this.wsUrl, this.wsOptions);
+      this.ws = new WebSocket(this.wsUrl, mergedOptions);
       this.setupEventHandlers();
     } catch (error: any) {
       this.logger.error('Failed to create WebSocket connection:', error.message);
