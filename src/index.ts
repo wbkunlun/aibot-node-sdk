@@ -27,6 +27,7 @@ export {
   type ImageMessage,
   type MixedMessage,
   type VoiceMessage,
+  type VideoMessage,
   type FileMessage,
   type MessageFrom,
   type TextContent,
@@ -34,6 +35,7 @@ export {
   type MixedContent,
   type MixedMsgItem,
   type VoiceContent,
+  type VideoContent,
   type FileContent,
   type QuoteContent,
   type ReplyOptions,
@@ -85,4 +87,6 @@ export {
   type EventMessage,
   type EventMessageWith,
   type Logger,
+  WSAuthFailureError,
+  WSReconnectExhaustedError,
 } from './types';

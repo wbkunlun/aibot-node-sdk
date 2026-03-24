@@ -46,10 +46,12 @@ export class WSClient extends EventEmitter<WSClientEventMap> {
     this.options = {
       reconnectInterval: 1000,
       maxReconnectAttempts: 10,
+      maxAuthFailureAttempts: 5,
       heartbeatInterval: 30000,
       requestTimeout: 10000,
       wsUrl: '',
       wsOptions: {},
+      maxReplyQueueSize: 500,
       logger: new DefaultLogger(),
       ...options,
     } as Required<WSClientOptions>;
@@ -70,6 +72,8 @@ export class WSClient extends EventEmitter<WSClientEventMap> {
       this.options.maxReconnectAttempts,
       this.options.wsUrl || undefined,
       this.options.wsOptions,
+      this.options.maxReplyQueueSize,
+      this.options.maxAuthFailureAttempts,
     );
 
     // 设置认证凭证

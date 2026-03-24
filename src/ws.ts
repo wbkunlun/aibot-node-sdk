@@ -2,7 +2,7 @@ import WebSocket, { type ClientOptions as WsClientOptions } from 'ws';
 import { getProxyForUrl } from 'proxy-from-env';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import type { Logger, WsFrame } from './types';
-import { WsCmd } from './types';
+import { WsCmd, WSAuthFailureError, WSReconnectExhaustedError } from './types';
 import { generateReqId } from './utils';
 
 /** SDK 内置默认 WebSocket 连接地址 */
@@ -30,8 +30,12 @@ export class WsConnectionManager {
   private heartbeatInterval: number;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private maxReconnectAttempts: number;
+  private maxAuthFailureAttempts: number;
   private reconnectAttempts: number = 0;
+  private authFailureAttempts: number = 0;
   private isManualClose: boolean = false;
+  /** 标记最近一次连接关闭是否因认证失败触发（用于 scheduleReconnect 区分重连类型） */
+  private lastCloseWasAuthFailure: boolean = false;
 
   /** 认证凭证 */
   private botId: string = '';
@@ -47,6 +51,8 @@ export class WsConnectionManager {
   private reconnectBaseDelay: number = 1000;
   /** Upper cap (ms) for reconnect delay */
   private readonly reconnectMaxDelay: number = 30000;
+  /** 重连定时器引用，用于在 disconnect/connect 时取消挂起的重连 */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** 按 req_id 分组的回复发送队列，保证同一 req_id 的消息串行发送 */
   private replyQueues: Map<string, ReplyQueueItem[]> = new Map();
@@ -62,7 +68,7 @@ export class WsConnectionManager {
   /** 回执超时时间（毫秒） */
   private readonly replyAckTimeout: number = 5000;
   /** 单个 req_id 的回复队列最大长度，超过后新消息将被拒绝 */
-  private readonly maxReplyQueueSize: number = 100;
+  private maxReplyQueueSize: number = 500;
 
   /** 连接建立回调（WebSocket open 事件，认证尚未完成） */
   public onConnected: (() => void) | null = null;
@@ -86,13 +92,19 @@ export class WsConnectionManager {
     maxReconnectAttempts: number = 10,
     wsUrl?: string,
     wsOptions?: WsClientOptions,
+    maxReplyQueueSize?: number,
+    maxAuthFailureAttempts?: number,
   ) {
     this.logger = logger;
     this.heartbeatInterval = heartbeatInterval;
     this.reconnectBaseDelay = reconnectBaseDelay;
     this.maxReconnectAttempts = maxReconnectAttempts;
+    this.maxAuthFailureAttempts = maxAuthFailureAttempts ?? 5;
     this.wsUrl = wsUrl || DEFAULT_WS_URL;
     this.wsOptions = wsOptions || {};
+    if (maxReplyQueueSize !== undefined) {
+      this.maxReplyQueueSize = maxReplyQueueSize;
+    }
   }
 
   /**
@@ -109,6 +121,12 @@ export class WsConnectionManager {
    */
   connect(): void {
     this.isManualClose = false;
+
+    // 取消挂起的重连定时器，防止与当前 connect 竞态
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     // 清理可能未完全关闭的旧连接
     if (this.ws) {
@@ -148,8 +166,10 @@ export class WsConnectionManager {
 
     this.ws.on('open', () => {
       this.logger.info('WebSocket connection established, sending auth...');
-      this.reconnectAttempts = 0;
+      // 注意：不在 open 时重置 reconnectAttempts，因为 TCP 连接成功不代表认证会成功。
+      // 只有在认证成功后才重置所有计数器（见 handleFrame 中的认证响应处理）。
       this.missedPongCount = 0;
+      this.lastCloseWasAuthFailure = false;
       // 连接建立后立即发送认证帧
       this.sendAuth();
       this.onConnected?.();
@@ -171,6 +191,8 @@ export class WsConnectionManager {
       this.stopHeartbeat();
       this.clearPendingMessages(`WebSocket connection closed (${reasonStr})`);
       this.onDisconnected?.(reasonStr);
+      // 释放旧 WebSocket 实例引用，便于 GC 回收
+      this.ws = null;
 
       if (!this.isManualClose) {
         this.scheduleReconnect();
@@ -245,6 +267,12 @@ export class WsConnectionManager {
         this.isManualClose = true;
         // 通知上层服务端主动断开
         this.onServerDisconnect?.('New connection established, server disconnected this connection');
+        // 主动关闭 socket，避免连接处于僵尸状态
+        if (this.ws) {
+          this.ws.removeAllListeners();
+          this.ws.terminate();
+          this.ws = null;
+        }
         return;
       }
 
@@ -260,9 +288,18 @@ export class WsConnectionManager {
       if (frame.errcode !== 0) {
         this.logger.error(`Authentication failed: errcode=${frame.errcode}, errmsg=${frame.errmsg}`);
         this.onError?.(new Error(`Authentication failed: ${frame.errmsg} (code: ${frame.errcode})`));
+        // 标记为认证失败，close 事件中 scheduleReconnect 会据此使用 authFailureAttempts 计数器
+        this.lastCloseWasAuthFailure = true;
+        // 认证失败，主动关闭连接，触发 close 事件进而执行 scheduleReconnect 重连逻辑
+        if (this.ws) {
+          this.ws.terminate();
+        }
         return;
       }
       this.logger.info('Authentication successful');
+      // 认证成功：重置所有重连计数器
+      this.reconnectAttempts = 0;
+      this.authFailureAttempts = 0;
       this.startHeartbeat();
       this.onAuthenticated?.();
       return;
@@ -344,29 +381,59 @@ export class WsConnectionManager {
 
   /**
    * 安排重连
+   *
+   * 区分两种重连场景，使用独立的计数器和最大重试次数：
+   * - 认证失败（lastCloseWasAuthFailure=true）：使用 authFailureAttempts / maxAuthFailureAttempts
+   * - 连接断开（lastCloseWasAuthFailure=false）：使用 reconnectAttempts / maxReconnectAttempts
+   *
+   * disconnected_event（被踢下线）不会触发重连，因为 isManualClose 已被设为 true。
    */
   private scheduleReconnect(): void {
-    if (this.maxReconnectAttempts !== -1 && this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.logger.error(`Max reconnect attempts reached (${this.maxReconnectAttempts}), giving up`);
-      this.onError?.(new Error('Max reconnect attempts exceeded'));
-      return;
+    if (this.lastCloseWasAuthFailure) {
+      // 认证失败场景
+      if (this.maxAuthFailureAttempts !== -1 && this.authFailureAttempts >= this.maxAuthFailureAttempts) {
+        this.logger.error(`Max auth failure attempts reached (${this.maxAuthFailureAttempts}), giving up`);
+        this.onError?.(new WSAuthFailureError(this.maxAuthFailureAttempts));
+        return;
+      }
+      this.authFailureAttempts++;
+
+      const delay = Math.min(
+        this.reconnectBaseDelay * Math.pow(2, this.authFailureAttempts - 1),
+        this.reconnectMaxDelay,
+      );
+
+      this.logger.info(`Auth failed, reconnecting in ${delay}ms (auth attempt ${this.authFailureAttempts}/${this.maxAuthFailureAttempts})...`);
+      this.onReconnecting?.(this.authFailureAttempts);
+
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        if (this.isManualClose) return;
+        this.connect();
+      }, delay);
+    } else {
+      // 连接断开场景（网络异常、心跳超时等）
+      if (this.maxReconnectAttempts !== -1 && this.reconnectAttempts >= this.maxReconnectAttempts) {
+        this.logger.error(`Max reconnect attempts reached (${this.maxReconnectAttempts}), giving up`);
+        this.onError?.(new WSReconnectExhaustedError(this.maxReconnectAttempts));
+        return;
+      }
+      this.reconnectAttempts++;
+
+      const delay = Math.min(
+        this.reconnectBaseDelay * Math.pow(2, this.reconnectAttempts - 1),
+        this.reconnectMaxDelay,
+      );
+
+      this.logger.info(`Connection lost, reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+      this.onReconnecting?.(this.reconnectAttempts);
+
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        if (this.isManualClose) return;
+        this.connect();
+      }, delay);
     }
-
-    this.reconnectAttempts++;
-    // Exponential back-off: 1s, 2s, 4s, 8s … capped at reconnectMaxDelay
-    const delay = Math.min(
-      this.reconnectBaseDelay * Math.pow(2, this.reconnectAttempts - 1),
-      this.reconnectMaxDelay,
-    );
-
-    this.logger.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})...`);
-    this.onReconnecting?.(this.reconnectAttempts);
-
-    setTimeout(() => {
-      if (this.isManualClose) return;
-      // 重连时直接使用内置默认地址，连接建立后自动重新认证
-      this.connect();
-    }, delay);
   }
 
   /**
@@ -560,6 +627,12 @@ export class WsConnectionManager {
     this.isManualClose = true;
     this.stopHeartbeat();
     this.clearPendingMessages('Connection manually closed');
+
+    // 取消挂起的重连定时器
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     if (this.ws) {
       this.ws.terminate();

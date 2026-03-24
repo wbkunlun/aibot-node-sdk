@@ -3,6 +3,7 @@
  */
 
 export type { Logger } from './common';
+export { WSAuthFailureError, WSReconnectExhaustedError } from './common';
 export type { WSClientOptions } from './config';
 export {
   MessageType,
@@ -12,12 +13,14 @@ export {
   type MixedMessage,
   type VoiceMessage,
   type FileMessage,
+  type VideoMessage,
   type MessageFrom,
   type TextContent,
   type ImageContent,
   type MixedContent,
   type MixedMsgItem,
   type VoiceContent,
+  type VideoContent,
   type FileContent,
   type QuoteContent,
   type ReplyOptions,
