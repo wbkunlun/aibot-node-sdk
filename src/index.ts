@@ -12,6 +12,7 @@ export { WSClient } from './client';
 export { WeComApiClient } from './api';
 export { WsConnectionManager } from './ws';
 export { MessageHandler } from './message-handler';
+export { WecomCrypto, decodeEncodingAESKey, pkcs7Pad, pkcs7Unpad } from './wecom-crypto';
 export { decryptFile } from './crypto';
 export { DefaultLogger } from './logger';
 export { generateReqId, generateRandomString } from './utils';
